@@ -1,14 +1,18 @@
 /** Shared synchronization ownership for projects accessed by MCP engines (#1835). */
 import { realpathSync } from 'fs';
+import * as path from 'path';
 import type { Socket } from 'net';
 import type CodeGraph from '../index';
-import { isInitialized } from '../directory';
+import { canonicalProjectRoot, getCodeGraphDir, isInitialized } from '../directory';
 import { LockUnavailableError, watchDisabledReason } from '../sync';
 import { getDaemonSocketCandidates } from './daemon-paths';
+import { addWatchdogProgressPaths } from './liveness-watchdog';
 import { connectWithHello } from './proxy';
 import { markWriterReady, readWriterLock, releaseWriterLock, tryAcquireWriterLock } from './writer-lock';
 
 interface Project {
+  /** Identity key: one entry however the root is spelled (#2278). */
+  key: string;
   cg: CodeGraph;
   refs: number;
   owner: boolean;
@@ -18,6 +22,8 @@ interface Project {
   socket: Socket | null;
   timer: NodeJS.Timeout;
   options: Parameters<CodeGraph['watch']>[0];
+  /** Drops the index files from the liveness watchdog's progress; set while this process writes them (#2404). */
+  dropProgress: (() => void) | null;
 }
 
 export interface ProjectLease {
@@ -35,13 +41,14 @@ export function acquireProject(
   options: Parameters<CodeGraph['watch']>[0],
 ): ProjectLease {
   root = realpathSync(root);
-  let project = projects.get(root);
+  const key = canonicalProjectRoot(root);
+  let project = projects.get(key);
   if (!project) {
     const cg = open();
-    project = { cg, refs: 0, owner: false, caughtUp: false, retirement: null, gate: null, socket: null, options,
-      timer: setInterval(() => { void ready(root, project!); }, 1000) };
+    project = { key, cg, refs: 0, owner: false, caughtUp: false, retirement: null, gate: null, socket: null, options,
+      dropProgress: null, timer: setInterval(() => { void ready(root, project!); }, 1000) };
     project.timer.unref();
-    projects.set(root, project);
+    projects.set(key, project);
   }
   const entry = project;
   entry.refs++;
@@ -80,9 +87,12 @@ function retire(root: string, project: Project): Promise<void> {
       setTimeout(finish, 25);
       return;
     }
-    projects.delete(root);
+    projects.delete(project.key);
     project.cg.close();
     if (project.owner) releaseWriterLock(root);
+    // After the close, which may still checkpoint the WAL on this thread.
+    project.dropProgress?.();
+    project.dropProgress = null;
     resolve();
   };
   finish();
@@ -108,6 +118,10 @@ function ready(root: string, project: Project): Promise<void> {
 
 async function activate(root: string, project: Project): Promise<void> {
   if (!isInitialized(root)) return;
+  // Rebuild what an interrupted bulk load dropped (off this thread, #1887)
+  // before writing: a sync's writes would wait out the rebuild's write lock
+  // with this thread blocked.
+  if (project.cg.hasPendingIndexRecovery?.()) await project.cg.recoverIndexes();
   const writer = tryAcquireWriterLock(root, 'fallback');
   if (writer.kind === 'taken') {
     // Keep a real daemon session, so its idle timeout cannot strand this reader.
@@ -115,7 +129,8 @@ async function activate(root: string, project: Project): Promise<void> {
     if (writer.existing?.mode === 'daemon') {
       for (const candidate of getDaemonSocketCandidates(root)) {
         const socket = await connectWithHello(candidate);
-        if (!socket || socket === 'version-mismatch') continue;
+        // A daemon of another version, older or not, is left to the project's own launchers.
+        if (!socket || typeof socket === 'string') continue;
         if (project.refs === 0) { socket.destroy(); return; }
         project.socket = socket;
         socket.once('close', () => {
@@ -140,6 +155,15 @@ async function activate(root: string, project: Project): Promise<void> {
     return;
   }
   project.owner = true;
+  // This process writes the index from here on, in long synchronous stretches
+  // on the main thread: the catch-up below and every watcher sync. The
+  // liveness watchdog must count its files advancing as progress, as it does
+  // for the project it was armed with; otherwise a long sync of any other
+  // project reads as a wedge and the server is killed mid-sync (#2404).
+  if (!project.dropProgress) {
+    const db = path.join(getCodeGraphDir(root), 'codegraph.db');
+    project.dropProgress = addWatchdogProgressPaths([db, `${db}-wal`]);
+  }
   const disabled = watchDisabledReason(root);
   if (disabled) {
     process.stderr.write(`[CodeGraph MCP] File watcher disabled for ${root} — ${disabled}.\n`);

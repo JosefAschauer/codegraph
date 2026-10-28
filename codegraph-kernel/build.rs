@@ -9,6 +9,9 @@ fn main() {
     // against the crates.io tarball (kotlin checklist §Grammar prep):
     //   parser.c  54104a7ef1555c265b746c790e0f8bb953cc17806e9df0c3af82f7f62c06a70a
     //   scanner.c 27f73337ec357fc341fa57538f34c14277b0346980c3405dc30beab6202ec6d0
+    // scanner.c carries docs/grammars/tree-sitter-kotlin.patch (same-line
+    // `e`-word semicolon fix), shared with the wasm build:
+    //   scanner.c 2ca842dd04b60b0a6df59a03e9ad01209d8c5641f079a79a84d65708669b6cb6 (patched)
     // Flags crib the tarball's own bindings/rust/build.rs.
     let mut c = cc::Build::new();
     c.include("grammars/kotlin");
@@ -83,4 +86,30 @@ fn main() {
     dart.flag_if_supported("-utf-8"); // msvc
     dart.compile("tree-sitter-dart");
     println!("cargo:rerun-if-changed=grammars/dart");
+
+    // Swift grammar — vendored C (fifth vendored-grammar-C language): the
+    // crates.io tree-sitter-swift 0.7.3 tarball's src/, the same sources the
+    // vendored wasm is built from (swift checklist §Grammar prep), with
+    // docs/grammars/tree-sitter-swift.patch applied to scanner.c. The crate's
+    // scanner builds `1UL << FAKE_TRY_BANG` (bit 32) into a constant table;
+    // where `unsigned long` is 32 bits that overflows — MSVC folds it to 0,
+    // so the Windows kernels read the `!` of every `try!` as a logical not
+    // and `try! Foo()` called `!Foo`. Upstream 0.7.4 writes `1ULL`; a bump to
+    // a fixed release can return to the crate (and the wasm moves with it).
+    //   parser.c  d3edff6effe31b9a507f496577407987343b101b23eb7bee7a9b050e8ab5d27a
+    //   scanner.c f3d6271d64f58c39eed544104a70ca2cf9ecbf80c5d900620f1afd38836542cb
+    //   scanner.c 8acafef098ea4a52ebfc4cdf2fe26706113a22ac8ba2faf7d952755ff350cad6 (patched)
+    // Flags crib the tarball's own bindings/rust/build.rs (c11). parser.c is
+    // ~20 MB.
+    let mut swift = cc::Build::new();
+    swift.std("c11");
+    swift.include("grammars/swift");
+    swift.file("grammars/swift/parser.c");
+    swift.file("grammars/swift/scanner.c");
+    swift.flag_if_supported("-Wno-unused-parameter");
+    swift.flag_if_supported("-Wno-unused-but-set-variable");
+    swift.flag_if_supported("-Wno-trigraphs");
+    swift.flag_if_supported("-utf-8"); // msvc
+    swift.compile("tree-sitter-swift");
+    println!("cargo:rerun-if-changed=grammars/swift");
 }

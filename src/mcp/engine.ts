@@ -16,8 +16,11 @@ import type CodeGraph from '../index';
 import { resolveServerRoot } from '../directory';
 import { ToolHandler } from './tools';
 import { WslSharedIndexError } from '../db/wsl-shared-index';
+import { DatabaseOpenError, isDatabaseOpenFailure } from '../db/open-error';
+import type { NodeSqliteUnavailableError } from '../db/node-sqlite';
 import { assertNoRebuild, releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { QueryPool, resolvePoolSize } from './query-pool';
+import { endFreshnessMeasurements } from './index-freshness';
 import { acquireProject, ProjectLease } from './project-lifecycle';
 
 // Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
@@ -31,6 +34,15 @@ const loadCodeGraph = (): typeof import('../index').default =>
 
 /** How often the per-tool-call retry may re-run the sub-project down-scan. */
 const RETRY_SUBSCAN_TTL_MS = 5_000;
+
+/**
+ * Why the default project failed to open, when a tool call should say so
+ * rather than "no project loaded": the Windows/WSL shared index (#995), or an
+ * index that exists but SQLite could not open, or no node:sqlite at all.
+ */
+function reportableOpenFailure(err: unknown): WslSharedIndexError | DatabaseOpenError | NodeSqliteUnavailableError | null {
+  return err instanceof WslSharedIndexError || isDatabaseOpenFailure(err) ? err : null;
+}
 
 export interface MCPEngineOptions {
   /** Serve existing index contents without syncing, watching, or claiming a writer slot. */
@@ -109,6 +121,15 @@ export class MCPEngine {
       activate: (cg) => this.explicitProjects.get(cg)?.ready() ?? Promise.resolve(),
       release: (cg) => this.releaseExplicitProject(cg),
     });
+    // A tool call found the default project's database replaced on disk (a
+    // `codegraph index` rebuild) and reopened it (#1902). Reconcile the new
+    // file with the usual catch-up — `sync()` serializes on the index mutex,
+    // so it never overlaps an in-flight watcher sync. Only when this engine is
+    // watching, i.e. it is the project's writer: a read-only engine (writer
+    // lock held elsewhere, watching disabled) must not start writing.
+    this.toolHandler.setOnDatabaseReopened((cg) => {
+      if (cg === this.cg && cg.isWatching()) this.catchUpSync(true);
+    });
     if (opts.writerLockRoot && !this.opts.readOnly) {
       assertNoRebuild(opts.writerLockRoot);
       const writer = tryAcquireWriterLock(opts.writerLockRoot, 'fallback');
@@ -156,6 +177,11 @@ export class MCPEngine {
   setProjectPathHint(projectPath: string): void {
     this.projectPath = projectPath;
     this.toolHandler.setDefaultProjectHint(projectPath);
+  }
+
+  /** Whether this engine only reads: no watcher, no sync, no writer slot. */
+  isReadOnly(): boolean {
+    return this.opts.readOnly;
   }
 
   /** Project root that the engine resolved on first init (null if none). */
@@ -231,15 +257,26 @@ export class MCPEngine {
         this.cg = null;
       }
       assertNoRebuild(resolvedRoot);
-      this.cg = loadCodeGraph().openSync(resolvedRoot, { readOnly: this.opts.readOnly });
+      // Indexes an interrupted bulk load dropped are rebuilt off this thread
+      // (#1887); the catch-up and tool calls wait for them.
+      this.cg = loadCodeGraph().openSync(resolvedRoot, { readOnly: this.opts.readOnly, deferIndexRecovery: true });
       this.projectPath = resolvedRoot;
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
       this.catchUpSync();
-      this.maybeStartPool(resolvedRoot);
+      // The pool's workers open the project themselves: start them on a
+      // rebuilt one, not racing the rebuild for its write lock.
+      const opened = this.cg;
+      if (opened?.hasPendingIndexRecovery()) {
+        void opened.recoverIndexes().catch(() => { /* reported by the tool call waiting on it */ }).then(() => {
+          if (this.cg === opened) this.maybeStartPool(resolvedRoot);
+        });
+      } else {
+        this.maybeStartPool(resolvedRoot);
+      }
     } catch (err) {
       // Still failing — caller will try again on the next tool call.
-      this.toolHandler.setDefaultOpenFailure(err instanceof WslSharedIndexError ? err : null);
+      this.toolHandler.setDefaultOpenFailure(reportableOpenFailure(err));
     }
   }
 
@@ -257,13 +294,16 @@ export class MCPEngine {
 
     // Detach + terminate the worker pool first so no tool call routes to a
     // worker mid-teardown; outstanding pool calls resolve with graceful guidance.
+    // Stopping waits for the workers to end — the pool's, and any
+    // `codegraph_status` change count still measuring: the daemon exits right
+    // after, and exiting while a worker is still starting up can crash the
+    // process.
     this.toolHandler.setQueryPool(null);
-    if (this.queryPool) {
-      void this.queryPool.destroy();
-      this.queryPool = null;
-    }
+    const poolDown = this.queryPool ? this.queryPool.destroy() : Promise.resolve();
+    this.queryPool = null;
+    const measurementsDown = endFreshnessMeasurements();
     const drained = this.toolHandler.closeAll();
-    this.stopPromise = drained.then(async () => {
+    this.stopPromise = Promise.all([drained, poolDown, measurementsDown]).then(async () => {
       if (this.initPromise) await this.initPromise;
       if (this.defaultLease) {
         await this.defaultLease.release();
@@ -367,7 +407,7 @@ export class MCPEngine {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[CodeGraph MCP] Failed to open project at ${resolvedRoot}: ${msg}\n`);
       // The agent otherwise hears only "no project loaded" (#995).
-      this.toolHandler.setDefaultOpenFailure(err instanceof WslSharedIndexError ? err : null);
+      this.toolHandler.setDefaultOpenFailure(reportableOpenFailure(err));
     }
   }
 
@@ -407,10 +447,12 @@ export class MCPEngine {
    * and the per-file staleness banner can't help because `getPendingFiles()`
    * is populated by the watcher, not by catch-up).
    */
-  private catchUpSync(): void {
+  private catchUpSync(afterReopen = false): void {
     const cg = this.cg;
     if (!cg || this.opts.readOnly) return;
-    if (this.defaultLease) {
+    // The lease's gate is the startup reconcile and stays settled once caught
+    // up; a database reopened after a rebuild (#1902) needs a sync of its own.
+    if (this.defaultLease && !afterReopen) {
       this.toolHandler.setCatchUpGate(this.defaultLease.ready());
       return;
     }

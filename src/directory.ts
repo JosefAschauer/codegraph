@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { isWslWindowsDrive } from './sync/watch-policy';
+import { loadNodeSqlite } from './db/node-sqlite';
 
 /** The default per-project data directory name. */
 export const DEFAULT_CODEGRAPH_DIR = '.codegraph';
@@ -122,8 +123,21 @@ export function getCodeGraphDir(projectRoot: string): string {
 }
 
 /**
- * Check if a project has been initialized with CodeGraph
- * Requires both .codegraph/ directory AND codegraph.db to exist
+ * Check if a project has been initialized with CodeGraph.
+ *
+ * Requires `.codegraph/codegraph.db` to exist AND to carry the codegraph
+ * schema. A file that merely exists — empty, or a SQLite database with no
+ * tables, as an interrupted `init` or a stray `touch` leaves behind — used to
+ * count as initialized, so one such file in an ANCESTOR directory (worst
+ * case: `$HOME`) captured the upward resolution of every project beneath it
+ * and made their real indexes unreachable (#1895).
+ *
+ * The probe is cheap and gated so hot callers (the prompt hook, MCP root
+ * resolution on every call) pay one `stat`: file size, then a read-only
+ * SQLite open with a single `sqlite_master` lookup — memoized per path +
+ * mtime + size so an unchanged db is never reopened. A database that cannot
+ * be inspected counts as initialized (see probeSchema) — only a proven-absent
+ * schema, or a file SQLite refuses as not a database, says no.
  */
 export function isInitialized(projectRoot: string): boolean {
   const codegraphDir = getCodeGraphDir(projectRoot);
@@ -132,7 +146,89 @@ export function isInitialized(projectRoot: string): boolean {
   }
   // Must have codegraph.db, not just .codegraph folder
   const dbPath = path.join(codegraphDir, 'codegraph.db');
-  return fs.existsSync(dbPath);
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(dbPath);
+  } catch {
+    return false;
+  }
+  return hasCodeGraphSchema(dbPath, st);
+}
+
+/**
+ * `codegraph.db` exists at `projectRoot` but does not carry the schema, and
+ * `init` can add it in place: an empty file, or a SQLite database without the
+ * codegraph tables (#1895). A file that is not SQLite at all is NOT this case —
+ * see {@link hasForeignDbFile}.
+ */
+export function hasSchemalessDb(projectRoot: string): boolean {
+  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  let st: fs.Stats;
+  try { st = fs.statSync(dbPath); } catch { return false; }
+  if (!st.isFile() || isInitialized(projectRoot)) return false;
+  return st.size === 0 || probeSchema(dbPath) === 'no-schema';
+}
+
+/**
+ * `codegraph.db` exists at `projectRoot` and is not a SQLite database (no
+ * header magic): SQLite refuses to open it, so `init` cannot rebuild it in
+ * place. The caller must say so rather than promise a repair; nothing here
+ * deletes the file.
+ */
+export function hasForeignDbFile(projectRoot: string): boolean {
+  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  let st: fs.Stats;
+  try { st = fs.statSync(dbPath); } catch { return false; }
+  return st.isFile() && st.size > 0 && probeSchema(dbPath) === 'not-sqlite';
+}
+
+/** A SQLite file header is 100 bytes; anything shorter cannot hold a schema. */
+const SQLITE_HEADER_SIZE = 100;
+/** SQLITE_NOTADB: SQLite read the file and it is not a database. */
+const SQLITE_NOTADB = 26;
+const schemaProbeCache = new Map<string, { mtimeMs: number; size: number; ok: boolean }>();
+
+function hasCodeGraphSchema(dbPath: string, st: fs.Stats): boolean {
+  if (!st.isFile() || st.size < SQLITE_HEADER_SIZE) return false;
+  const cached = schemaProbeCache.get(dbPath);
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.ok;
+  const probe = probeSchema(dbPath);
+  const ok = probe === 'schema' || probe === 'unknown';
+  schemaProbeCache.set(dbPath, { mtimeMs: st.mtimeMs, size: st.size, ok });
+  return ok;
+}
+
+/**
+ * What `codegraph.db` holds, asked of SQLite itself through a read-only
+ * connection: the codegraph schema, a database without it, not a database at
+ * all (SQLITE_NOTADB), or `unknown` — locked, busy, a WAL db in a directory we
+ * cannot create `-shm` in (read-only checkout, mount, another user's tree),
+ * disk I/O. Callers treat `unknown` as initialized: the pre-existing behaviour
+ * for a database we cannot inspect.
+ *
+ * The file is never read through a descriptor of our own, not even for its
+ * 16-byte header. Closing ANY descriptor on a database file drops every POSIX
+ * lock this process holds on it, including those of a connection it already
+ * has open (sqlite.org/howtocorrupt.html §2.2.1) — and the MCP server resolves
+ * projects through isInitialized on every call while it holds the index as
+ * its writer. SQLite's own connections share one lock table per file, so a
+ * second connection opened and closed here leaves the first one's locks alone.
+ */
+function probeSchema(dbPath: string): 'schema' | 'no-schema' | 'not-sqlite' | 'unknown' {
+  let db: any = null;
+  try {
+    // A runtime without node:sqlite can't inspect the file: `unknown`, so the
+    // command goes on to open it and reports why that is impossible.
+    const { DatabaseSync } = loadNodeSqlite();
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").get();
+    return row !== undefined ? 'schema' : 'no-schema';
+  } catch (error) {
+    return (error as { errcode?: number })?.errcode === SQLITE_NOTADB ? 'not-sqlite' : 'unknown';
+  } finally {
+    // Never hold the handle: Windows file locking would block the owner.
+    try { db?.close(); } catch { /* already closed */ }
+  }
 }
 
 /**
@@ -207,6 +303,40 @@ export function statInode(p: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Canonicalize a project root for IDENTITY: hashing it into a rendezvous key
+ * (the daemon's named pipe / tmpdir socket, a registry record). Not for display
+ * — the caller-visible root keeps its own spelling.
+ *
+ * The contract is that two spellings of ONE directory yield ONE string, because
+ * a client that derives a different key silently fails to meet the daemon that
+ * is already running: it probes a socket nobody bound, spawns a redundant
+ * daemon, and that daemon dies on the lock the first one holds, so the session
+ * degrades to a single-process engine. `path.resolve` alone does NOT satisfy
+ * that contract — NTFS is case-insensitive, so `d:\work\codegraph` and
+ * `D:\work\codegraph` name one directory but two strings, and non-native
+ * `fs.realpathSync` keeps whichever casing the caller passed (only `.native`
+ * asks the filesystem for the on-disk name — the same reason
+ * {@link isSameIndexRoot} uses it). Both spellings really do occur: a
+ * cwd-derived root is the on-disk case, while a client-supplied
+ * `rootUri`/`workspaceFolders` path arrives as `file:///d%3A/…`.
+ *
+ * The Windows lowercase is belt-and-braces on top of the native realpath — NTFS
+ * can't hold two directories differing only by case, and it also absorbs a
+ * `\\?\`-prefixed native result diverging from a plain one.
+ */
+export function canonicalProjectRoot(projectRoot: string): string {
+  const resolved = path.resolve(projectRoot);
+  let canonical = resolved;
+  try {
+    canonical = fs.realpathSync.native(resolved);
+  } catch {
+    // ENOENT/EACCES/ELOOP — the root is normally there (`.codegraph/` lives in
+    // it), so this is a fallback rather than a path we expect to take.
+  }
+  return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
 }
 
 /**
@@ -806,11 +936,11 @@ function ensureGitignore(gitignorePath: string): boolean {
  */
 export function createDirectory(projectRoot: string): void {
   const codegraphDir = getCodeGraphDir(projectRoot);
-  const dbPath = path.join(codegraphDir, 'codegraph.db');
 
-  // Only throw if CodeGraph is actually initialized (db exists)
-  // .codegraph/ folder alone is fine
-  if (fs.existsSync(dbPath)) {
+  // Only throw if CodeGraph is actually initialized (db with a schema).
+  // .codegraph/ folder alone — or a schema-less codegraph.db left by an
+  // interrupted init (#1895) — is fine: initialize() adds the schema to it.
+  if (isInitialized(projectRoot)) {
     throw new Error(`CodeGraph already initialized in ${projectRoot}`);
   }
 
@@ -984,4 +1114,52 @@ export function validateDirectory(projectRoot: string): {
  */
 export function isTaskNotification(prompt: string): boolean {
   return /^\s*<task-notification>[\s\S]*<\/task-notification>\s*$/.test(prompt);
+}
+
+/**
+ * Claude Code hands a subagent's report back to the parent session as a
+ * `<agent-message from="…">…</agent-message>` prompt, which UserPromptSubmit
+ * hooks also receive (#2184). Same rule as {@link isTaskNotification}: only a
+ * prompt that is entirely that envelope is skipped.
+ */
+export function isAgentMessage(prompt: string): boolean {
+  return /^\s*<agent-message(?:\s[^>]*)?>[\s\S]*<\/agent-message>\s*$/.test(prompt);
+}
+
+/**
+ * A message another local Claude Code session sends to this one arrives as a
+ * `<cross-session-message from="…">…</cross-session-message>` prompt, which
+ * UserPromptSubmit hooks also receive (#2635). Same rule as
+ * {@link isTaskNotification}: only a prompt that is entirely that envelope is
+ * skipped.
+ */
+export function isCrossSessionMessage(prompt: string): boolean {
+  return /^\s*<cross-session-message(?:\s[^>]*)?>[\s\S]*<\/cross-session-message>\s*$/.test(prompt);
+}
+
+const SYSTEM_REMINDER_CLOSE = '</system-reminder>';
+/** One complete reminder block. The attribute run stops at `<`, so a tag left
+ *  open in pasted text can't make the scan quadratic. */
+const SYSTEM_REMINDER_BLOCK = /<system-reminder(?:\s[^<>]*)?>[\s\S]*?<\/system-reminder>/g;
+
+/**
+ * The prompt the user typed, without the `<system-reminder>…</system-reminder>`
+ * blocks Claude Code's desktop app puts in front of it, such as which other
+ * local sessions are linked. UserPromptSubmit hooks receive them as
+ * part of the prompt (#2635), but they are the host's status, not the user's
+ * words: gated and explored on, they made every turn, a bare "yes" included,
+ * inject context about the reminder, and they hid a task notification, a
+ * subagent hand-back or a cross-session message behind them from
+ * {@link isTaskNotification}, {@link isAgentMessage} and
+ * {@link isCrossSessionMessage}. Every complete block is removed and the rest
+ * trimmed; a `<system-reminder>` the user only mentions, with no closing tag,
+ * stays.
+ */
+export function stripSystemReminders(prompt: string): string {
+  // Only the text up to the last closing tag can hold a complete block, and
+  // bounding the scan there keeps an unclosed tag from rescanning the tail.
+  const end = prompt.lastIndexOf(SYSTEM_REMINDER_CLOSE);
+  if (end < 0) return prompt.trim();
+  const head = prompt.slice(0, end + SYSTEM_REMINDER_CLOSE.length);
+  return (head.replace(SYSTEM_REMINDER_BLOCK, '\n') + prompt.slice(head.length)).trim();
 }

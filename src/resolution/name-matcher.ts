@@ -21538,8 +21538,10 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
     // BaseManager.from_queryset(QuerySet))` — subclasses that class: the
     // qualifier is the supertype, not the method called on it.
     // A parameterized base, `Base[User]`, is `Base`: its type arguments are no supertypes.
+    // The list is read whole, as `pythonBases` reads it: black and ruff wrap a
+    // long one past the three lines `head` holds.
     case 'python': {
-      let bases = /\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1];
+      let bases = pythonBaseList(cls, context);
       while (bases && /\[[^[\]]*\]/.test(bases)) bases = bases.replace(/\[[^[\]]*\]/g, '');
       return names(bases?.replace(/\w+\s*=\s*[\w.]+/g, '').replace(/([A-Za-z_][\w.]*)\.\w+\s*\(/g, '$1 ('));
     }

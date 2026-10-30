@@ -86,6 +86,43 @@ def use_commented():
 
 def use_wrapped_generic():
     current_d.run()
+
+
+def keep(cls):
+    return cls
+
+
+@keep
+class DecoratedOneLine(Mixin, Base):
+    pass
+
+
+@keep
+class DecoratedWrapped(
+    Mixin,
+    Base,
+):
+    pass
+
+
+def class_one_line(x):
+    OneLine.run(x)
+
+
+def class_wrapped(x):
+    Wrapped.run(x)
+
+
+def class_commented(x):
+    Commented.run(x)
+
+
+def class_decorated_one_line(x):
+    DecoratedOneLine.run(x)
+
+
+def class_decorated_wrapped(x):
+    DecoratedWrapped.run(x)
 `);
   cg = await CodeGraph.init(root, { index: true });
 });
@@ -120,5 +157,26 @@ describe('a Python base list wrapped over several lines', () => {
 
   it('reads a parameterized base wrapped inside the list', () => {
     expect(calls('use_wrapped_generic')).toEqual(['Base::run']);
+  });
+});
+
+// A call through the class name, `Wrapped.run(x)`, finds `run` through the
+// supertypes the class head declares (`declaredSupertypes`), a second reader.
+describe('a class-name call through a wrapped base list', () => {
+  it('resolves through a one-line list (control)', () => {
+    expect(calls('class_one_line')).toEqual(['Base::run']);
+  });
+
+  it('resolves through a wrapped list', () => {
+    expect(calls('class_wrapped')).toEqual(['Base::run']);
+  });
+
+  it('skips comments inside the list, parentheses and all', () => {
+    expect(calls('class_commented')).toEqual(['Base::run']);
+  });
+
+  it('reads the head of a decorated class, one line or wrapped', () => {
+    expect(calls('class_decorated_one_line')).toEqual(['Base::run']);
+    expect(calls('class_decorated_wrapped')).toEqual(['Base::run']);
   });
 });
